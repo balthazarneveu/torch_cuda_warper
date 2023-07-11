@@ -35,7 +35,7 @@ pytest-3 test_warp.py
 
 ## Bench
 ```
-python3 test_warper.py
+python3 test_warp.py
 ```
 
 ```
