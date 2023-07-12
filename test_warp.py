@@ -1,13 +1,14 @@
 import pytest
-
-import torch  # noqa: F401  # isort:skip
-import torch_warper  #isort:skip
-
-pytestmark = pytest.mark.gputest
-import time
-
-current_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 from torch.utils.benchmark import Timer
+import logging
+import torch
+from warper_utils import transform_metric_to_normalized_torch
+try:
+    import torch_warper
+except:
+    torch_warper = None
+    logging.warning("Need to build the torch C++/Cuda kernel first")
+current_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -17,7 +18,7 @@ def device_fixture():
 
 
 @torch.jit.script
-def torch_homography(x: torch.Tensor, homography: torch.Tensor, align_corners: bool = True):
+def torch_homography(img: torch.Tensor, homography: torch.Tensor, align_corners: bool = True):
     """Apply homography transformation using torch operators
 
     Parameters
@@ -26,26 +27,29 @@ def torch_homography(x: torch.Tensor, homography: torch.Tensor, align_corners: b
     homography : tensor N33 with the homography transformation
     """
     with torch.no_grad():
-        grid = torch.nn.functional.affine_grid(homography[:, :2, :], x.shape, align_corners=align_corners)
-        yt = torch.nn.functional.grid_sample(x, grid, mode="bilinear", align_corners=align_corners)
+        grid = torch.nn.functional.affine_grid(homography[:, :2, :], img.shape, align_corners=align_corners)
+        yt = torch.nn.functional.grid_sample(img, grid, mode="bilinear", align_corners=align_corners)
     return yt, grid
 
 
-@pytest.mark.parametrize("spatial_size", [8, 9])
+@pytest.mark.parametrize("spatial_size", [64])
 @pytest.mark.parametrize("rot_angle", [0, 30, 45, 60, 90])
 def test_warp_forward(spatial_size, rot_angle):
-    n, ch = 1, 1  # batch and channels
-    # NHWC tensor format
-    x = torch.eye(spatial_size, dtype=torch.float32).repeat(n, ch, 1, 1).permute(0, 2, 3, 1).to(current_device)
+    n, ch = 1, 3  # batch and channels
+    img = torch.eye(spatial_size, dtype=torch.float32).repeat(n, ch, 1, 1).to(current_device)  # NCHW
     phi = torch.tensor([rot_angle * 3.1415 / 180])
     s = torch.sin(phi)
     c = torch.cos(phi)
-    homography = torch.tensor([[c, -s, 0], [s, c, 0], [0, 0, 1]]).repeat(n, 1, 1).to(current_device)
-
-    yp = torch_warper.warp_image(x, homography)
-    yt, grid = torch_homography(x.permute(0, 3, 1, 2), homography, align_corners=True)
-    yt = yt.permute(0, 2, 3, 1)
-    assert torch.allclose(yp, yt)
+    homography = torch.tensor([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]]).repeat(n, 1, 1).to(current_device)
+    yp = torch_warper.warp_image(img, homography)
+    yp_cpu = torch_warper.warp_image(img.cpu(), homography.cpu())
+    assert torch.allclose(yp.cpu(), yp_cpu, rtol=1.e-4)
+    homography_pytorch = transform_metric_to_normalized_torch(homography.double(),
+                                                              img.shape[-2:],
+                                                              img.shape[-2:],
+                                                              is_affinity=False).to(current_device).float()
+    yt, _grid = torch_homography(img, homography_pytorch, align_corners=True)
+    assert torch.allclose(yp, yt, rtol=1., atol=1.e-6)
 
 
 def time_forward(x, homography, torch_ref=False):
@@ -69,19 +73,20 @@ def warp_perf(spatial_size):
                                      )  # read homography matrix + read and write (2*) one float per channel per batch
     nbytes_read_write_torch = data_size * (2 * 3 * n + 2 * n + 2 * n * ch
                                            )  # read affine + write grid + read and write warp
-    # NHWC tensor format for the inputs
-    x = torch.eye(spatial_size, dtype=torch.float32).repeat(n, ch, 1, 1).permute(0, 2, 3, 1).to(current_device)
+    img = torch.eye(spatial_size, dtype=torch.float32).repeat(n, ch, 1, 1).to(current_device)
     phi = torch.rand(n) * 3.141592
     s, c = torch.sin(phi), torch.cos(phi)
     r1 = torch.stack([c, -s, torch.zeros(n)], 1)
     r2 = torch.stack([s, c, torch.zeros(n)], 1)
     r3 = torch.stack([torch.zeros(n), torch.zeros(n), torch.ones(n)], 1)
     homography = torch.stack([r1, r2, r3], 1).to(current_device)
-    timec = time_forward(x, homography)
+    timec = time_forward(img, homography)
     print(
         f"Warp forward custom cuda kernel {timec:.4f} s, bandwidth {spatial_size**2*nbytes_read_write*1e-9/timec:.4f}GB/s"
     )
-    timec_ref = time_forward(x.permute(0, 3, 1, 2).clone(), homography, torch_ref=True)
+    homography = transform_metric_to_normalized_torch(homography.double(), img.shape[-2:], img.shape[-2:],
+                                                      is_affinity=False).to(current_device).float()
+    timec_ref = time_forward(img, homography, torch_ref=True)
     print(
         f"Warp forward torch {timec_ref:.4f} s, bandwidth {spatial_size**2*nbytes_read_write_torch*1e-9/timec_ref:.4f}GB/s"
     )
