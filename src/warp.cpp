@@ -33,10 +33,10 @@ torch::Tensor warpImage(torch::Tensor& image,
 
     torch::Tensor out_image;
     if (width && height) {
-        out_image = torch::ones({image.size(BATCH_DIM), image.size(CHANNELS_DIM), height.value(), width.value()},
+        out_image = torch::zeros({image.size(BATCH_DIM), image.size(CHANNELS_DIM), height.value(), width.value()},
                                 image.options());
     } else {
-        out_image = torch::ones_like(image);
+        out_image = torch::zeros_like(image);
     }
     if (image.is_cuda()) {
         AT_ASSERTM(image.is_cuda(), "Expecting the image tensor to be stored in GPU memory");
